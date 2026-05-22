@@ -2,7 +2,7 @@
 tracker:
   kind: github
   api_key: $GITHUB_TOKEN
-  repository: john-arheghan-114543/PayItModernization
+  repository: john-arheghan-114543/mobile
   state_source: labels
   state_label_prefix: "status:"
   active_states: ["Todo", "In Progress","Open"]

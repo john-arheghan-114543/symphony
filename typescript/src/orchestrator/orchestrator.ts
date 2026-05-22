@@ -35,6 +35,10 @@ interface RunningInternal extends RunningEntry {
   advisory_output_tokens: number;
   advisory_cache_creation_input_tokens: number;
   advisory_cache_read_input_tokens: number;
+  // Most recent extended-thinking block. Cleared at turn boundaries so the
+  // dashboard reflects what the agent is currently reasoning about.
+  latest_thinking: string | null;
+  latest_thinking_at: string | null;
 }
 
 export class Orchestrator extends EventEmitter {
@@ -350,6 +354,8 @@ export class Orchestrator extends EventEmitter {
       advisory_output_tokens: 0,
       advisory_cache_creation_input_tokens: 0,
       advisory_cache_read_input_tokens: 0,
+      latest_thinking: null,
+      latest_thinking_at: null,
     };
     this.running.set(issue.id, entry);
     log.info("dispatch_started", {
@@ -533,6 +539,11 @@ export class Orchestrator extends EventEmitter {
     if (event.payload) {
       if (event.event === "assistant_text") {
         entry.last_message = String(event.payload.text || "").slice(0, 240);
+      } else if (event.event === "assistant_thinking") {
+        const txt = String(event.payload.text || "");
+        entry.latest_thinking = txt;
+        entry.latest_thinking_at = event.timestamp;
+        entry.last_message = `thinking · ${firstLine(txt).slice(0, 200)}`;
       } else if (event.event === "tool_use") {
         entry.last_message = `tool:${event.payload.name}`;
       } else if (event.event === "tool_result") {
@@ -542,6 +553,13 @@ export class Orchestrator extends EventEmitter {
       } else {
         entry.last_message = event.event;
       }
+    }
+    // Clear stale thinking at turn boundaries so the dashboard doesn't show
+    // last turn's reasoning during the next turn.
+    if (event.event === "turn_completed" || event.event === "turn_failed" ||
+        event.event === "turn_cancelled" || event.event === "turn_ended_with_error") {
+      entry.latest_thinking = null;
+      entry.latest_thinking_at = null;
     }
     if (event.claude_pid) entry.claude_pid = event.claude_pid;
     if (event.usage) {
@@ -789,6 +807,8 @@ export class Orchestrator extends EventEmitter {
         cost_usd: r.total_cost_usd,
         events: r.events.slice(-30),
         workspace_path: r.workspace_path,
+        latest_thinking: r.latest_thinking,
+        latest_thinking_at: r.latest_thinking_at,
       };
     });
     const retrying = Array.from(this.retry_attempts.values()).map((r) => ({
@@ -848,4 +868,9 @@ function trackerSignature(t: ServiceConfig["tracker"]): string {
 function nextAttempt(prev: number | null): number {
   if (prev == null) return 1;
   return prev + 1;
+}
+
+function firstLine(s: string): string {
+  const i = s.indexOf("\n");
+  return (i === -1 ? s : s.slice(0, i)).trim();
 }

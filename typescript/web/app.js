@@ -119,6 +119,7 @@ function eventCategory(name) {
   if (!name) return "";
   if (/fail|error|cancel|timeout|stall/.test(name)) return "err";
   if (/completed|started|usage|ok|success/.test(name)) return "ok";
+  if (/thinking/.test(name)) return "think";
   return "";
 }
 
@@ -190,6 +191,16 @@ function RunningCard({ run, expanded, onToggle }) {
 
       ${expanded ? html`
         <div class="run-detail">
+          ${run.latest_thinking ? html`
+            <div class="thinking-callout">
+              <div class="thinking-head">
+                <span class="thinking-dot"></span>
+                <span class="thinking-label">Thinking</span>
+                <span class="thinking-time">${fmtRelative(run.latest_thinking_at)}</span>
+              </div>
+              <div class="thinking-body">${run.latest_thinking}</div>
+            </div>
+          ` : null}
           <div class="section-title" style=${{ margin: "0 0 10px" }}>
             Event stream <span class="count">${run.events?.length || 0}</span>
           </div>

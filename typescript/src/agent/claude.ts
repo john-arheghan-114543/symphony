@@ -210,7 +210,15 @@ export async function runTurn(ctx: TurnContext): Promise<TurnResult> {
         .filter((c: any) => c?.type === "text")
         .map((c: any) => c?.text || "")
         .join("");
+      const thinkingBlocks = content
+        .filter((c: any) => c?.type === "thinking")
+        .map((c: any) => c?.thinking || "")
+        .filter(Boolean)
+        .join("\n\n");
       const toolBlocks = content.filter((c: any) => c?.type === "tool_use");
+      if (thinkingBlocks) {
+        emit("assistant_thinking", { text: truncate(thinkingBlocks, 4000) });
+      }
       if (textBlocks) {
         emit("assistant_text", { text: truncate(textBlocks, 1000) });
       }
