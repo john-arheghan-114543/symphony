@@ -87,12 +87,24 @@ export class WorkspaceManager {
   }
 }
 
-export function hookEnv(issue: Issue, workspacePath: string, attempt: number | null): Record<string, string> {
+export function hookEnv(
+  issue: Issue,
+  workspacePath: string,
+  attempt: number | null,
+  /**
+   * Authenticated clone URL produced by the tracker. Pass null when the
+   * tracker has no associated git repo (e.g. an ADO project without a
+   * configured `repository:` key). The URL embeds a secret — never log
+   * the full env that contains it.
+   */
+  repoUrl: string | null = null,
+): Record<string, string> {
   return {
     SYMPHONY_ISSUE_ID: issue.id,
     SYMPHONY_ISSUE_IDENTIFIER: issue.identifier,
     SYMPHONY_ISSUE_NUMBER: String(issue.number),
     SYMPHONY_ISSUE_REPOSITORY: issue.repository,
+    SYMPHONY_ISSUE_REPO_URL: repoUrl ?? "",
     SYMPHONY_ISSUE_TITLE: issue.title ?? "",
     SYMPHONY_ISSUE_BRANCH_NAME: issue.branch_name ?? "",
     SYMPHONY_ISSUE_STATE: issue.state,

@@ -16,7 +16,7 @@ import type {
   ServiceConfig,
   WorkflowDefinition,
 } from "../types.js";
-import { GitHubTracker, TrackerError } from "../tracker/github.js";
+import { createTracker, isRebaseCapable, TrackerError, type Tracker } from "../tracker/index.js";
 import { WorkspaceManager, hookEnv, runHook, runHookBestEffort } from "../workspace/manager.js";
 import { runTurn, validateAddDirs } from "../agent/claude.js";
 import {
@@ -60,7 +60,7 @@ export class Orchestrator extends EventEmitter {
   private tracker_rate_limits: RateLimitSnapshot | null = null;
 
   private workflow: WorkflowDefinition;
-  private tracker: GitHubTracker;
+  private tracker: Tracker;
   private workspaceManager: WorkspaceManager;
   private tickTimer: NodeJS.Timeout | null = null;
   private stopped = false;
@@ -71,7 +71,7 @@ export class Orchestrator extends EventEmitter {
   constructor(workflow: WorkflowDefinition) {
     super();
     this.workflow = workflow;
-    this.tracker = new GitHubTracker(workflow.config.tracker);
+    this.tracker = createTracker(workflow.config.tracker);
     this.workspaceManager = new WorkspaceManager(workflow.config.workspace.root);
     this.effectivePollIntervalMs = workflow.config.polling.interval_ms;
   }
@@ -87,7 +87,7 @@ export class Orchestrator extends EventEmitter {
     this.workflow = workflow;
     if (prevTrackerKey !== nextTrackerKey) {
       try {
-        this.tracker = new GitHubTracker(workflow.config.tracker);
+        this.tracker = createTracker(workflow.config.tracker);
       } catch (e: any) {
         log.error("tracker reload failed; keeping previous", { error: e.message });
       }
@@ -145,6 +145,9 @@ export class Orchestrator extends EventEmitter {
         log.warn("dispatch validation failed", { errors: v.errors.join(",") });
         return;
       }
+      // Detect parked-for-review PRs with conflicts and flip their labels so
+      // they re-enter candidacy. Skipped silently when rebase.enabled = false.
+      await this.reviewSweep();
       try {
         const { issues, rate } = await this.tracker.fetchCandidateIssues();
         this.tracker_rate_limits = rate;
@@ -153,12 +156,14 @@ export class Orchestrator extends EventEmitter {
           identifiers: issues.slice(0, 10).map((i) => i.identifier).join(","),
         });
         if (issues.length === 0) {
+          const t = this.cfg().tracker;
           log.info("poll_tick_no_candidates", {
-            repository: this.cfg().tracker.repository ?? null,
-            project_id: this.cfg().tracker.project_id ?? null,
-            active_states: this.cfg().tracker.active_states.join("|"),
-            include_labels: this.cfg().tracker.label_filters?.include?.join("|") ?? null,
-            assignee_filter: this.cfg().tracker.assignee_filter?.join("|") ?? null,
+            kind: t.kind,
+            repository: t.repository ?? null,
+            project_id: t.kind === "github" ? t.project_id ?? null : null,
+            active_states: t.active_states.join("|"),
+            include_labels: t.label_filters?.include?.join("|") ?? null,
+            assignee_filter: t.assignee_filter?.join("|") ?? null,
           });
         }
         for (const issue of this.sortForDispatch(issues)) {
@@ -171,6 +176,72 @@ export class Orchestrator extends EventEmitter {
     } finally {
       this.emit("snapshot", this.snapshot());
       this.scheduleTick(this.effectivePollIntervalMs);
+    }
+  }
+
+  private async reviewSweep(): Promise<void> {
+    const rebase = this.cfg().rebase;
+    if (!rebase?.enabled) return;
+    // PR rebase loop is GitHub-only in v1. ADO can be added later by
+    // implementing RebaseCapableTracker against the ADO PR REST API.
+    if (!isRebaseCapable(this.tracker)) return;
+    const cfg = this.cfg().tracker;
+    if (cfg.kind !== "github" || !cfg.repository) return;
+    const [owner, name] = cfg.repository.split("/", 2);
+    if (!owner || !name) return;
+    let parked;
+    try {
+      parked = await this.tracker.fetchParkedForReview();
+      this.tracker_rate_limits = parked.rate;
+    } catch (e: any) {
+      this.handleTrackerError(e, "review_sweep");
+      return;
+    }
+    for (const i of parked.issues) {
+      if (!i.pr) continue;
+      if (i.pr.mergeable === "UNKNOWN") continue; // GitHub still computing
+      if (i.pr.mergeable !== "CONFLICTING") continue;
+      if (this.running.has(i.id) || this.claimed.has(i.id)) continue;
+
+      const attempt = rebaseAttemptCount(i.labels);
+      try {
+        if (attempt >= rebase.max_attempts) {
+          await this.tracker.swapLabels(
+            owner,
+            name,
+            i.number,
+            ["needs-human"],
+            ["needs-rebase", `rebase-attempt-${attempt}`],
+          );
+          log.warn("rebase_exhausted_escalated_to_human", {
+            issue_identifier: i.identifier,
+            attempts: attempt,
+            pr: i.pr.number,
+          });
+        } else {
+          const next = attempt + 1;
+          const removeLabels = ["needs-review"];
+          if (attempt > 0) removeLabels.push(`rebase-attempt-${attempt}`);
+          await this.tracker.swapLabels(
+            owner,
+            name,
+            i.number,
+            ["needs-rebase", `rebase-attempt-${next}`],
+            removeLabels,
+          );
+          log.info("rebase_triggered", {
+            issue_identifier: i.identifier,
+            attempt: next,
+            pr: i.pr.number,
+            mergeable: i.pr.mergeable,
+          });
+        }
+      } catch (e: any) {
+        log.warn("rebase_label_swap_failed", {
+          issue_identifier: i.identifier,
+          error: e?.message,
+        });
+      }
     }
   }
 
@@ -383,7 +454,10 @@ export class Orchestrator extends EventEmitter {
       entry.status = "PreparingWorkspace";
       const ws = await this.workspaceManager.createForIssue(entry.identifier);
       entry.workspace_path = ws.path;
-      const env = hookEnv(entry.issue, ws.path, attempt);
+      // Tracker provides the authenticated clone URL (contains a secret —
+      // never log full env). Used by WORKFLOW.md's `after_create` hook.
+      const repoUrl = this.tracker.cloneUrl(entry.issue);
+      const env = hookEnv(entry.issue, ws.path, attempt, repoUrl);
 
       if (ws.created_now && cfg.hooks.after_create) {
         const r = await runHook(
@@ -498,7 +572,7 @@ export class Orchestrator extends EventEmitter {
           "after_run",
           this.cfg().hooks.after_run as string,
           entry.workspace_path,
-          hookEnv(entry.issue, entry.workspace_path, attempt),
+          hookEnv(entry.issue, entry.workspace_path, attempt, this.tracker.cloneUrl(entry.issue)),
           this.cfg().hooks.timeout_ms,
         );
       }
@@ -742,7 +816,11 @@ export class Orchestrator extends EventEmitter {
   private handleTrackerError(e: any, label: string) {
     if (e instanceof TrackerError) {
       log.warn("tracker_error", { code: e.code, label, message: e.message });
-      if (e.code === "github_rate_limited" || e.code === "github_secondary_rate_limit") {
+      const isRateLimited =
+        e.code === "github_rate_limited" ||
+        e.code === "github_secondary_rate_limit" ||
+        e.code === "ado_rate_limited";
+      if (isRateLimited) {
         const cap = Math.min(this.effectivePollIntervalMs * 4, this.cfg().agent.max_retry_backoff_ms);
         this.rateLimitBackoffUntilMs = Date.now() + cap;
       }
@@ -809,6 +887,7 @@ export class Orchestrator extends EventEmitter {
         workspace_path: r.workspace_path,
         latest_thinking: r.latest_thinking,
         latest_thinking_at: r.latest_thinking_at,
+        pr: r.issue.pr ?? null,
       };
     });
     const retrying = Array.from(this.retry_attempts.values()).map((r) => ({
@@ -827,14 +906,17 @@ export class Orchestrator extends EventEmitter {
       claude_totals: this.claude_totals,
       tracker_rate_limits: this.tracker_rate_limits,
       claude_rate_limits: this.claude_rate_limits,
-      workflow: {
-        source: this.workflow.source_path,
-        tracker_kind: this.cfg().tracker.kind,
-        repository: this.cfg().tracker.repository ?? null,
-        project_id: this.cfg().tracker.project_id ?? null,
-        poll_interval_ms: this.effectivePollIntervalMs,
-        max_concurrent_agents: this.cfg().agent.max_concurrent_agents,
-      },
+      workflow: (() => {
+        const t = this.cfg().tracker;
+        return {
+          source: this.workflow.source_path,
+          tracker_kind: t.kind,
+          repository: t.repository ?? null,
+          project_id: t.kind === "github" ? t.project_id ?? null : null,
+          poll_interval_ms: this.effectivePollIntervalMs,
+          max_concurrent_agents: this.cfg().agent.max_concurrent_agents,
+        };
+      })(),
     };
   }
 
@@ -856,11 +938,22 @@ export class Orchestrator extends EventEmitter {
 }
 
 function trackerSignature(t: ServiceConfig["tracker"]): string {
+  if (t.kind === "github") {
+    return JSON.stringify({
+      kind: t.kind,
+      endpoint: t.endpoint,
+      repository: t.repository,
+      project_id: t.project_id,
+      api_key_present: !!t.api_key,
+    });
+  }
+  // azuredevops
   return JSON.stringify({
     kind: t.kind,
     endpoint: t.endpoint,
+    organization: t.organization,
+    project: t.project,
     repository: t.repository,
-    project_id: t.project_id,
     api_key_present: !!t.api_key,
   });
 }
@@ -873,4 +966,16 @@ function nextAttempt(prev: number | null): number {
 function firstLine(s: string): string {
   const i = s.indexOf("\n");
   return (i === -1 ? s : s.slice(0, i)).trim();
+}
+
+function rebaseAttemptCount(labels: string[]): number {
+  let max = 0;
+  for (const l of labels) {
+    const m = /^rebase-attempt-(\d+)$/.exec(l);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+  }
+  return max;
 }

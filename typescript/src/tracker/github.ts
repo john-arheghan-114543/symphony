@@ -6,7 +6,9 @@ import type {
   Issue,
   RateLimitSnapshot,
   TrackerConfig,
+  TrackerConfigGitHub,
 } from "../types.js";
+import type { RebaseCapableTracker } from "./index.js";
 import { log } from "../logging/logger.js";
 
 const USER_AGENT = "symphony-ts/0.1";
@@ -26,7 +28,7 @@ export interface FetchResult {
 }
 
 interface InternalContext {
-  cfg: TrackerConfig;
+  cfg: TrackerConfigGitHub;
   token: string;
   graphqlEndpoint: string;
   restEndpoint: string;
@@ -35,7 +37,8 @@ interface InternalContext {
   viewerLogin: string | null;
 }
 
-export class GitHubTracker {
+export class GitHubTracker implements RebaseCapableTracker {
+  readonly kind = "github" as const;
   private ctx: InternalContext;
 
   constructor(cfg: TrackerConfig) {
@@ -64,6 +67,16 @@ export class GitHubTracker {
 
   getRateLimits(): RateLimitSnapshot {
     return { ...this.ctx.rate };
+  }
+
+  /**
+   * Authenticated HTTPS clone URL. Embeds the access token; never log.
+   * Returns null when the issue has no repository slug (shouldn't happen
+   * for properly-fetched GitHub issues but defensive nonetheless).
+   */
+  cloneUrl(issue: Issue): string | null {
+    if (!issue.repository) return null;
+    return `https://x-access-token:${this.ctx.token}@github.com/${issue.repository}.git`;
   }
 
   /** Resolve `@me` in assignee_filter to the authenticated viewer's login. */
@@ -110,6 +123,115 @@ export class GitHubTracker {
   async fetchIssuesByStates(stateNames: string[]): Promise<FetchResult> {
     if (stateNames.length === 0) return { issues: [], rate: this.getRateLimits() };
     return await this.fetchTerminalSweep(stateNames);
+  }
+
+  /**
+   * Fetch issues currently labeled `needs-review` along with the mergeable
+   * state of the open PR on their corresponding `symphony/<branch>` head.
+   * Used by the orchestrator's review sweep to detect PRs that need rebasing.
+   */
+  async fetchParkedForReview(label = "needs-review"): Promise<FetchResult> {
+    if (!this.ctx.cfg.repository) return { issues: [], rate: this.getRateLimits() };
+    const [owner, name] = this.ctx.cfg.repository.split("/", 2);
+    if (!owner || !name) return { issues: [], rate: this.getRateLimits() };
+    const query = `
+      query($owner:String!, $name:String!, $labels:[String!]) {
+        repository(owner:$owner, name:$name) {
+          issues(states: OPEN, labels: $labels, first: 100, orderBy:{field: UPDATED_AT, direction: DESC}) {
+            nodes {
+              id
+              number
+              title
+              state
+              stateReason
+              url
+              createdAt
+              updatedAt
+              body
+              repository { nameWithOwner }
+              labels(first: 50) { nodes { name } }
+              assignees(first: 20) { nodes { login } }
+            }
+          }
+          pullRequests(states: OPEN, first: 100, orderBy:{field: UPDATED_AT, direction: DESC}) {
+            nodes { number url headRefName mergeable state }
+          }
+        }
+        rateLimit { remaining resetAt cost }
+      }`;
+    const result = await this.graphql(query, { owner, name, labels: [label] });
+    this.updateRateFromGraphQL(result.data?.rateLimit);
+    const issueNodes = (result.data?.repository?.issues?.nodes || []) as any[];
+    const prNodes = (result.data?.repository?.pullRequests?.nodes || []) as any[];
+    const prByHead = new Map<string, any>();
+    for (const pr of prNodes) {
+      if (pr?.headRefName) prByHead.set(pr.headRefName, pr);
+    }
+    const issues = issueNodes.filter(Boolean).map((n) => {
+      const issue = this.normalizeIssueNode(n);
+      const head = symphonyBranchRef(issue.branch_name);
+      const pr = head ? prByHead.get(head) : undefined;
+      issue.pr = pr
+        ? {
+            number: pr.number,
+            url: pr.url,
+            head_ref_name: pr.headRefName,
+            mergeable: (pr.mergeable as any) || "UNKNOWN",
+            state: (pr.state as any) || "OPEN",
+          }
+        : null;
+      return issue;
+    });
+    return { issues, rate: this.getRateLimits() };
+  }
+
+  /**
+   * Add and/or remove labels on a single issue via the REST API.
+   * Idempotent — missing-label DELETEs return 404 which we silently swallow.
+   */
+  async swapLabels(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    add: string[],
+    remove: string[],
+  ): Promise<void> {
+    const base = `${this.ctx.restEndpoint}/repos/${owner}/${repo}/issues/${issueNumber}/labels`;
+    const headers = {
+      Authorization: `Bearer ${this.ctx.token}`,
+      "User-Agent": USER_AGENT,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": REST_API_VERSION,
+      "Content-Type": "application/json",
+    };
+    if (add.length > 0) {
+      const resp = await fetchWithTimeout(base, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ labels: add }),
+      });
+      this.updateRateFromHeaders(resp.headers);
+      if (!resp.ok) {
+        throw new TrackerError(
+          "github_label_add_failed",
+          `POST labels HTTP ${resp.status} ${resp.statusText}`,
+        );
+      }
+    }
+    for (const label of remove) {
+      const resp = await fetchWithTimeout(`${base}/${encodeURIComponent(label)}`, {
+        method: "DELETE",
+        headers,
+      });
+      this.updateRateFromHeaders(resp.headers);
+      // 404 = label wasn't on the issue. Treat as success (idempotent).
+      if (!resp.ok && resp.status !== 404) {
+        throw new TrackerError(
+          "github_label_remove_failed",
+          `DELETE label ${label}: HTTP ${resp.status} ${resp.statusText}`,
+        );
+      }
+    }
   }
 
   async fetchIssueStatesByIds(ids: string[]): Promise<FetchResult> {
@@ -571,6 +693,22 @@ function defaultBranchName(number: number, title: string): string {
     .replace(/(^-+|-+$)/g, "")
     .slice(0, 60);
   return slug ? `${number}-${slug}` : String(number);
+}
+
+/** The git head ref Symphony pushes to (matches WORKFLOW.md's before_run hook). */
+export function symphonyBranchRef(branchName: string | null | undefined): string | null {
+  if (!branchName) return null;
+  return `symphony/${branchName}`;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NETWORK_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function deriveBlockers(node: any, repoSlug: string): BlockerRef[] {

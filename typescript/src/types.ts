@@ -6,6 +6,14 @@ export interface BlockerRef {
   state: string | null;
 }
 
+export interface PullRequestRef {
+  number: number;
+  url: string;
+  head_ref_name: string;
+  mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  state: "OPEN" | "CLOSED" | "MERGED";
+}
+
 export interface Issue {
   id: string;
   identifier: string;
@@ -15,6 +23,11 @@ export interface Issue {
   description: string | null;
   priority: number | null;
   state: string;
+  /**
+   * Tracker-agnostic open/closed signal. Named `github_state` for legacy
+   * reasons; the ADO tracker populates it based on whether `state` is in
+   * the configured `terminal_states`.
+   */
   github_state: "open" | "closed";
   branch_name: string | null;
   url: string | null;
@@ -23,11 +36,22 @@ export interface Issue {
   blocked_by: BlockerRef[];
   created_at: string | null;
   updated_at: string | null;
+  pr?: PullRequestRef | null;
 }
 
-export interface TrackerConfig {
-  kind: string;
+export interface TrackerConfigCommon {
   endpoint: string;
+  assignee_filter?: string[];
+  label_filters?: {
+    include?: string[];
+    exclude?: string[];
+  };
+  active_states: string[];
+  terminal_states: string[];
+}
+
+export interface TrackerConfigGitHub extends TrackerConfigCommon {
+  kind: "github";
   api_key?: string;
   app_credentials?: {
     app_id?: string | number;
@@ -42,14 +66,20 @@ export interface TrackerConfig {
   priority_source: "labels" | "project" | "none";
   priority_label_pattern: string;
   priority_field: string;
-  assignee_filter?: string[];
-  label_filters?: {
-    include?: string[];
-    exclude?: string[];
-  };
-  active_states: string[];
-  terminal_states: string[];
 }
+
+export interface TrackerConfigAdo extends TrackerConfigCommon {
+  kind: "azuredevops";
+  api_key: string;               // Personal Access Token, required
+  organization: string;          // ADO org slug
+  project: string;               // ADO project name (or id)
+  repository?: string;           // ADO git repo name (used for clone URL)
+  work_item_types?: string[];    // WIQL [System.WorkItemType] IN filter
+  area_path?: string;            // WIQL [System.AreaPath] UNDER filter
+  iteration_path?: string;       // WIQL [System.IterationPath] UNDER filter
+}
+
+export type TrackerConfig = TrackerConfigGitHub | TrackerConfigAdo;
 
 export interface PollingConfig {
   interval_ms: number;
@@ -91,6 +121,11 @@ export interface ClaudeConfig {
   continuation_prompt?: string;
 }
 
+export interface RebaseConfig {
+  enabled: boolean;
+  max_attempts: number;
+}
+
 export interface ServiceConfig {
   tracker: TrackerConfig;
   polling: PollingConfig;
@@ -98,6 +133,7 @@ export interface ServiceConfig {
   hooks: HooksConfig;
   agent: AgentConfig;
   claude: ClaudeConfig;
+  rebase: RebaseConfig;
 }
 
 export interface WorkflowDefinition {
@@ -178,11 +214,17 @@ export interface ClaudeTotals {
 }
 
 export interface RateLimitSnapshot {
+  // GitHub
   graphql_remaining?: number;
   graphql_reset_at?: string;
   rest_remaining?: number;
   rest_reset_at?: string;
+  // Common
   retry_after_ms?: number;
+  // Azure DevOps
+  tstu_remaining?: number;          // X-RateLimit-Remaining (TSTU budget)
+  tstu_reset_at?: string;           // X-RateLimit-Reset (ISO)
+  server_delay_ms?: number;         // X-RateLimit-Delay (ms)
 }
 
 export type RuntimeEvent = {

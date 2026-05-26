@@ -12,7 +12,7 @@ tracker:
   assignee_filter: ["@me"]
   label_filters:
     include: ["feat"]
-    exclude: ["needs-human"]
+    exclude: ["needs-human", "needs-review"]
 
 polling:
   interval_ms: 30000
@@ -23,14 +23,18 @@ workspace:
 
 hooks:
   after_create: |
-    git clone --depth=1 \
-      https://x-access-token:${GITHUB_TOKEN}@github.com/${SYMPHONY_ISSUE_REPOSITORY}.git .
+    git clone --depth=1 "${SYMPHONY_ISSUE_REPO_URL}" .
     git config user.email "symphony-bot@example.com"
     git config user.name  "Symphony Bot"
   before_run: |
     git fetch origin
     DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
-    git checkout -B "symphony/${SYMPHONY_ISSUE_BRANCH_NAME}" "origin/${DEFAULT_BRANCH}"
+    BRANCH="symphony/${SYMPHONY_ISSUE_BRANCH_NAME}"
+    if git rev-parse --verify "refs/remotes/origin/${BRANCH}" >/dev/null 2>&1; then
+      git checkout -B "${BRANCH}" "origin/${BRANCH}"
+    else
+      git checkout -B "${BRANCH}" "origin/${DEFAULT_BRANCH}"
+    fi
   after_run: |
     git status --short || true
 
@@ -46,6 +50,10 @@ claude:
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
   stall_timeout_ms: 300000
+
+rebase:
+  enabled: true        # opt in to detect needs-review PRs with merge conflicts and auto-rebase
+  max_attempts: 2       # after this many tries, escalate to needs-human
 ---
 
 # Issue {{ issue.identifier }}: {{ issue.title }}
@@ -58,6 +66,27 @@ Assignees: {{ issue.assignees | join: ", " }}
 > This is retry/continuation attempt #{{ attempt }}.
 {% endif %}
 
+{% if issue.labels contains "needs-rebase" %}
+## Your task — rebase this PR onto the default branch
+
+Your existing pull request has a merge conflict with the default branch. The
+orchestrator has set the `needs-rebase` label and re-dispatched you to resolve it.
+
+1. `gh pr list --head "symphony/{{ issue.branch_name }}" --state open --json number,baseRefName,headRefName,mergeable,url`
+   — confirm the PR number and base branch.
+2. `git fetch origin` and `git rebase origin/$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)`.
+3. For each conflict, read both sides, choose the resolution that keeps the project's tests passing.
+   Do NOT just take one side blindly — understand both intents.
+4. Run the project's tests (e.g. `npm test`, `pytest`, `mix test`) and iterate on conflicts until everything is green.
+5. `git push --force-with-lease origin "symphony/{{ issue.branch_name }}"`.
+6. Use `gh` to remove the `needs-rebase` label from this issue and re-add `needs-review`.
+   **Do not touch any `rebase-attempt-N` label** — the orchestrator manages that counter.
+7. Stop. Do not modify unrelated files; this turn is strictly for conflict resolution.
+
+If after one honest attempt the conflict cannot be resolved (semantic conflict, missing context,
+the project's tests can't be made to pass), add the `needs-human` label, comment with your
+blockers, and stop. Do not force-push a half-broken rebase.
+{% else %}
 ## Description
 
 {{ issue.description }}
@@ -76,3 +105,4 @@ Assignees: {{ issue.assignees | join: ", " }}
 If you hit something you can't resolve (missing context, broken environment, ambiguous
 requirements), add the `needs-human` label, comment with your blockers, and stop. Do not
 fabricate solutions.
+{% endif %}

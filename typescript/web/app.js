@@ -143,6 +143,16 @@ function RunningCard({ run, expanded, onToggle }) {
             ${issueUrl
               ? html`<a class="external" href=${issueUrl} target="_blank" rel="noreferrer" onClick=${(e) => e.stopPropagation()}>↗ github</a>`
               : null}
+            ${run.pr
+              ? html`<a
+                  class=${"pr-badge " + (run.pr.mergeable || "unknown").toLowerCase()}
+                  href=${run.pr.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick=${(e) => e.stopPropagation()}
+                  title=${"PR #" + run.pr.number + " · " + run.pr.mergeable}
+                >PR #${run.pr.number} · ${(run.pr.mergeable || "unknown").toLowerCase()}</a>`
+              : null}
           </div>
           <div class="run-title">${run.title || "(no title)"}</div>
           ${LabelChips({ labels: run.labels })}
