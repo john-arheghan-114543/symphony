@@ -11,15 +11,20 @@
 tracker:
   kind: azuredevops
   endpoint: https://dev.azure.com          # default; override for ADO Server
-  organization: your-ado-org
-  project: YourProject
-  repository: YourRepo                     # ADO git repo for the clone URL
+  organization: nbsdev
+  project: Extraction
+  repository: LumberSite                     # ADO git repo for the clone URL
   api_key: $ADO_PAT                        # Personal Access Token
 
-  # WIQL filters (all optional)
+  # WIQL filters (all optional). Uncomment and customize to your project.
+  # IMPORTANT: area_path and iteration_path MUST reference values that exist
+  # in your ADO project — ADO will reject the WIQL query with TF51011 if they
+  # don't. List real values with:
+  #   az boards area      project list --project <project> --org https://dev.azure.com/<org>
+  #   az boards iteration project list --project <project> --org https://dev.azure.com/<org>
   work_item_types: ["User Story", "Bug"]
-  area_path: "YourProject\\Team A"         # backslashes in YAML, doubled
-  iteration_path: "YourProject\\Sprint 24"
+  # area_path: "Extraction\\Team A"        # backslashes in YAML, doubled
+  # iteration_path: "Extraction\\Sprint 24"
 
   # State machine — Agile process defaults. Pick the ones for YOUR template.
   #   Agile:  New / Active / Resolved / Closed / Removed
